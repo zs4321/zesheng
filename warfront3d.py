@@ -16,7 +16,7 @@ MAX_DEPTH = 55
 BLACK=(0,0,0); WHITE=(255,255,255); RED=(220,40,40); DRED=(140,0,0)
 YELLOW=(255,200,0); GREEN=(40,200,40); DGREEN=(20,100,20)
 GRAY=(120,120,120); DGRAY=(60,60,60); VGRAY=(30,30,30); ORANGE=(255,140,0)
-SAVE_FILE = Path.home() / ".warfront3d_save"
+_FONT_CACHE = {}
 
 # ═══════════════════════════════════════════════════════════════
 # SAVE SYSTEM
@@ -77,12 +77,18 @@ def mk_bgm():
 # ═══════════════════════════════════════════════════════════════
 CN_FONT = None
 def dtxt(s, txt, pos, sz=24, col=WHITE, bold=False, ctr=False, shd=True):
-    f=pygame.font.SysFont(CN_FONT or "arial",sz,bold=bold)
+    key = (CN_FONT or "arial", sz, bold)
+    f = _FONT_CACHE.get(key)
+    if f is None:
+        f = pygame.font.SysFont(CN_FONT or "arial", sz, bold=bold)
+        _FONT_CACHE[key] = f
     if shd:
-        sh=f.render(txt,True,BLACK); r=sh.get_rect(center=pos) if ctr else sh.get_rect(topleft=pos)
-        r.x+=2; r.y+=2; s.blit(sh,r)
-    r2=f.render(txt,True,col); r=r2.get_rect(center=pos) if ctr else r2.get_rect(topleft=pos)
-    s.blit(r2,r)
+        sh = f.render(txt, True, BLACK)
+        r = sh.get_rect(center=pos) if ctr else sh.get_rect(topleft=pos)
+        r.x += 2; r.y += 2; s.blit(sh, r)
+    r2 = f.render(txt, True, col)
+    r = r2.get_rect(center=pos) if ctr else r2.get_rect(topleft=pos)
+    s.blit(r2, r)
 
 def dbar(s,x,y,w,h,ratio,col,bg=VGRAY):
     pygame.draw.rect(s,bg,(x,y,w,h)); pygame.draw.rect(s,col,(x+1,y+1,int((w-2)*max(0,min(1,ratio))),h-2))
@@ -202,8 +208,7 @@ def gen_classic_map():
 # RAYCASTING
 # ═══════════════════════════════════════════════════════════════
 def cast_rays(px, py, pa, world, MS):
-    rays=[]; zbuf=[]
-    cos_pa=math.cos(pa); sin_pa=math.sin(pa)
+    rays = []; zbuf = []
     for i in range(NUM_RAYS):
         angle = pa - FOV/2 + (i/NUM_RAYS)*FOV
         ra_cos=math.cos(angle); ra_sin=math.sin(angle)
@@ -287,6 +292,10 @@ class Game:
         except Exception:
             pass
 
+        # Disable IME so it doesn't intercept WASD keys during gameplay.
+        # Login input now uses KEYDOWN.unicode, which works without IME.
+        pygame.key.stop_text_input()
+
         # Init state (empty, will load on login)
         self.user_name = ""
         self.max_ul = 0
@@ -312,15 +321,50 @@ class Game:
         self.ws_selected=set()
         self.pending_level=None
 
+        # Cached surfaces for performance
+        self.hud_gradient = None       # HUD bottom bar gradient
+        self.dmg_flash = pygame.Surface((W, H), pygame.SRCALPHA)   # damage flash reuse
+        self.overlay_surf = pygame.Surface((W, H), pygame.SRCALPHA)  # dead/win overlay
+        self.overlay_surf.fill((0, 0, 0, 160))
+        self._mini_world_surf = None   # pre-rendered static minimap
+        self._mini_world_key = None    # cache key for minimap
+
         # Cover particles
         self.cparts=[{"x":random.randint(0,W),"y":random.randint(0,H),
             "vx":random.uniform(-0.3,0.3),"vy":random.uniform(-1,-0.2),
             "sz":random.uniform(1,3),"a":random.uniform(0.1,0.4)} for _ in range(50)]
 
+        # Login screen: starfield (pre-generated for performance)
+        self.login_stars=[]
+        for _ in range(220):
+            self.login_stars.append({
+                "x":random.randint(0,W),"y":random.randint(0,H),
+                "r":random.uniform(0.4,2.2),
+                "phase":random.uniform(0,2*math.pi),
+                "spd":random.uniform(0.01,0.04),
+                "col":random.choice([(180,200,255),(255,220,180),(200,220,255),(255,255,220)])
+            })
+        # Login screen: nebula blobs (soft colored regions)
+        self.login_nebulae=[]
+        for _ in range(6):
+            self.login_nebulae.append({
+                "x":random.randint(100,W-100),"y":random.randint(50,H-150),
+                "r":random.uniform(60,140),
+                "col":random.choice([(15,10,40),(20,5,30),(10,15,35),(25,10,25)]),
+                "phase":random.uniform(0,2*math.pi)
+            })
+        # Login ambient drone
+        try:
+            self.login_drone=mk_wav(55,3.0,0.3,3000)
+            self.login_drone.set_volume(0.12)
+        except:
+            self.login_drone=None
+        self._login_drone_channel=None
+
         self.reset()
 
     def reset(self):
-        self.px=16; self.py=16; self.pa=0; self.view_pa=0
+        self.px=16; self.py=16; self.pa=0
         self.hp=100; self.max_hp=100
         self.cur_w=0
         self.ammo={wk:WEAPONS[wk]["mag"] for wk in self.warehouse}
@@ -333,6 +377,7 @@ class Game:
         self.shake=0; self.muzzle=0; self.recoil=0; self.dflash=0
         self.bob=0
         self.jump_y=0; self.vjump=0
+        self._mini_world_surf = None; self._mini_world_key = None
 
     # ─── LOOP ──────────────────────────────────────────────
     def run(self):
@@ -346,9 +391,6 @@ class Game:
     def events(self):
         for e in pygame.event.get():
             if e.type==pygame.QUIT: self.running=False
-            elif e.type==pygame.TEXTINPUT:
-                if self.state=="LOGIN" and e.text and len(self.name_buf)<16:
-                    self.name_buf+=e.text
             elif e.type==pygame.KEYDOWN:
                 if self.state=="LOGIN":
                     if e.key==pygame.K_RETURN and self.name_buf.strip():
@@ -356,15 +398,13 @@ class Game:
                         _, self.max_ul, self.playtime, self.coins, self.warehouse = load_save(self.user_name)
                         if not self.warehouse: self.warehouse=[0]
                         self.state="MENU"
+                        self._stop_login_drone()
                     elif e.key==pygame.K_BACKSPACE: self.name_buf=self.name_buf[:-1]
-                    elif e.key==pygame.K_ESCAPE: self.running=False
-                    # Physical key fallback for IME Chinese input mode
-                    elif e.key >= pygame.K_a and e.key <= pygame.K_z:
-                        if len(self.name_buf)<16: self.name_buf+=chr(ord('a') + e.key - pygame.K_a)
-                    elif e.key >= pygame.K_0 and e.key <= pygame.K_9:
-                        if len(self.name_buf)<16: self.name_buf+=chr(ord('0') + e.key - pygame.K_0)
-                    elif e.key == pygame.K_SPACE:
-                        if len(self.name_buf)<16: self.name_buf+=" "
+                    elif e.key==pygame.K_ESCAPE:
+                        self._stop_login_drone()
+                        self.running=False
+                    elif e.unicode and e.unicode.isprintable() and len(self.name_buf)<16:
+                        self.name_buf+=e.unicode
                 elif self.state=="MENU":
                     if e.key==pygame.K_1: self.mode="level"; self.state="SELECT"
                     elif e.key==pygame.K_2:
@@ -397,7 +437,7 @@ class Game:
                             self.rld=w["reload"]
                             if len(self.snd)>4: self.snd[4].play()
                     if e.key==pygame.K_SPACE and self.jump_y<=0:
-                        self.vjump=4.0
+                        self.vjump=8.0
                     for i in range(1,6):
                         if e.key==getattr(pygame,f"K_{i}",-1) and i-1<len(self.weapons):
                             self.cur_w=i-1; self.rld=0
@@ -405,10 +445,9 @@ class Game:
                 if self.state=="PLAY":
                     if e.button==1: self.shoot()
                     elif e.button==3: self.throw_gren()
-                    elif e.button==4 and self.minimap_big is not None:
-                        # Check minimap click
-                        mx,my=pygame.mouse.get_pos()
-                        if mx>W-170 and my<170: self.minimap_big=not self.minimap_big
+                    elif e.button==4:
+                        # Back-button toggles minimap
+                        self.minimap_big = not self.minimap_big
                 elif self.state=="SELECT":
                     self._select_click()
                 elif self.state=="MENU":
@@ -470,34 +509,19 @@ class Game:
         pygame.draw.line(self.screen,YELLOW,(W//2-180,85),(W//2+180,85),2)
 
         # Draw owned weapons list
-        gx0=W//2-340; gy0=120
-        for i,wk in enumerate(self.warehouse):
-            c,r=i%3,i//3; rx,ry=gx0+c*240,gy0+r*140
-            rw,rh=215,115
-            w=WEAPONS[wk]
-            mx,my=pygame.mouse.get_pos()
-            hvr=rx<mx<rx+rw and ry<my<ry+rh
-            bg=(55,55,65) if hvr else (40,40,48)
-            bdr=YELLOW if hvr else GRAY
-            pygame.draw.rect(self.screen,bg,(rx,ry,rw,rh),border_radius=8)
-            pygame.draw.rect(self.screen,bdr,(rx,ry,rw,rh),2 if hvr else 1,border_radius=8)
-            dtxt(self.screen,w["name"],(rx+rw//2,ry+18),20,WHITE,True,True,False)
-            dtxt(self.screen,f"伤害: {w['dmg']}",(rx+12,ry+45),13,GRAY,shd=False)
-            dtxt(self.screen,f"射速: {w['rate']}",(rx+12,ry+62),13,GRAY,shd=False)
-            dtxt(self.screen,f"弹匣: {w['mag']}",(rx+12,ry+79),13,GRAY,shd=False)
-            dtxt(self.screen,f"备弹: {self.ammo.get(wk,0)}/{self.reserve.get(wk,0)}",(rx+12,ry+96),13,YELLOW,shd=False)
-            # weapon type indicator
-            wc=WCOL[wk]
-            pygame.draw.rect(self.screen,wc,(rx+rw-30,ry+10,16,16),border_radius=3)
+        gx0, gy0 = W//2-340, 120
+        mx, my = pygame.mouse.get_pos()
+        for i, wk in enumerate(self.warehouse):
+            c, r = i%3, i//3; rx, ry = gx0+c*240, gy0+r*140
+            rw, rh = 215, 115
+            w = WEAPONS[wk]
+            hvr = rx<mx<rx+rw and ry<my<ry+rh
+            self._draw_card(rx, ry, rw, rh, w["name"], [
+                (f"伤害: {w['dmg']} | 射速: {w['rate']}", GRAY, 13),
+                (f"弹匣: {w['mag']} | 备弹: {self.ammo.get(wk,0)}/{self.reserve.get(wk,0)}", YELLOW, 13),
+            ], YELLOW, hvr, icon=WCOL[wk])
 
-        # Bottom bar
-        for i in range(35):
-            y=H-35+i; r=i/35
-            c=(int(YELLOW[0]*(1-r*0.7)),int(YELLOW[1]*(1-r*0.7)),int(YELLOW[2]*(1-r*0.7)))
-            pygame.draw.line(self.screen,c,(0,y),(W,y))
-        for x in range(-35,W+35,50):
-            pygame.draw.polygon(self.screen,BLACK,[(x,H-35),(x+25,H-35),(x+40,H),(x+15,H)])
-        dtxt(self.screen,"ESC 返回菜单 | ENTER 进入菜单",(W//2,H-22),15,BLACK,True,True,False)
+        self._draw_bottom_bar(35, text="ESC 返回菜单 | ENTER 进入菜单")
 
     def _draw_weapon_select(self):
         self.screen.fill((18,18,22))
@@ -507,43 +531,33 @@ class Game:
         pygame.draw.line(self.screen,YELLOW,(W//2-180,85),(W//2+180,85),2)
 
         # Draw warehouse weapons
-        gx0=W//2-340; gy0=120
-        for i,wk in enumerate(self.warehouse):
-            c,r=i%3,i//3; rx,ry=gx0+c*240,gy0+r*140
-            rw,rh=215,115
-            w=WEAPONS[wk]
-            selected=wk in self.ws_selected
-            mx,my=pygame.mouse.get_pos()
-            hvr=rx<mx<rx+rw and ry<my<ry+rh
-            bg=(55,55,65) if hvr and selected else (40,40,48) if selected else (25,25,28)
-            bdr=YELLOW if selected else GRAY
-            pygame.draw.rect(self.screen,bg,(rx,ry,rw,rh),border_radius=8)
-            pygame.draw.rect(self.screen,bdr,(rx,ry,rw,rh),2 if selected else 1,border_radius=8)
+        gx0, gy0 = W//2-340, 120
+        mx, my = pygame.mouse.get_pos()
+        for i, wk in enumerate(self.warehouse):
+            c, r = i%3, i//3; rx, ry = gx0+c*240, gy0+r*140
+            rw, rh = 215, 115
+            w = WEAPONS[wk]
+            selected = wk in self.ws_selected
+            hvr = rx<mx<rx+rw and ry<my<ry+rh
+            accent = YELLOW if selected else GRAY
+            self._draw_card(rx, ry, rw, rh, w["name"], [
+                (f"伤害: {w['dmg']} | 射速: {w['rate']}", GRAY, 13),
+                (f"弹匣: {w['mag']} | 备弹: {self.ammo.get(wk,0)}/{self.reserve.get(wk,0)}", YELLOW, 13),
+            ], accent, hvr, selected, icon=WCOL[wk])
             if selected:
-                pygame.draw.circle(self.screen,YELLOW,(rx+rw-20,ry+20),10)
-                dtxt(self.screen,"✓",(rx+rw-20,ry+20),14,BLACK,True,True,False)
-            dtxt(self.screen,w["name"],(rx+rw//2,ry+18),20,WHITE,True,True,False)
-            dtxt(self.screen,f"伤害: {w['dmg']}",(rx+12,ry+45),13,GRAY,shd=False)
-            dtxt(self.screen,f"射速: {w['rate']}",(rx+12,ry+62),13,GRAY,shd=False)
-            dtxt(self.screen,f"弹匣: {w['mag']}",(rx+12,ry+79),13,GRAY,shd=False)
-            wc=WCOL[wk]
-            pygame.draw.rect(self.screen,wc,(rx+rw-30,ry+40,16,16),border_radius=3)
+                pygame.draw.circle(self.screen, YELLOW, (rx+rw-22, ry+22), 11)
+                dtxt(self.screen, "✓", (rx+rw-22, ry+22), 14, BLACK, True, True, False)
 
         # Start button
-        btn_x,btn_y=W//2-100,H-100
-        has_sel=len(self.ws_selected)>0
-        mx,my=pygame.mouse.get_pos()
-        btn_hvr=btn_x<mx<btn_x+200 and btn_y<my<btn_y+50
-        btn_bg=(80,60,30) if btn_hvr and has_sel else (50,40,25) if has_sel else (35,35,35)
-        btn_bdr=YELLOW if btn_hvr and has_sel else GRAY if has_sel else (60,60,60)
-        pygame.draw.rect(self.screen,btn_bg,(btn_x,btn_y,200,50),border_radius=8)
-        pygame.draw.rect(self.screen,btn_bdr,(btn_x,btn_y,200,50),2,border_radius=8)
-        btn_col=WHITE if has_sel else (80,80,80)
-        dtxt(self.screen,"开始战斗",(btn_x+100,btn_y+25),20,btn_col,True,True,False)
+        btn_x, btn_y = W//2-100, H-100
+        has_sel = len(self.ws_selected) > 0
+        btn_hvr = btn_x<mx<btn_x+200 and btn_y<my<btn_y+50
+        self._draw_card(btn_x, btn_y, 200, 50, "开始战斗",
+            hover=btn_hvr, enabled=has_sel)
         if not has_sel:
             dtxt(self.screen,"请至少选择一把武器",(W//2,btn_y-15),14,RED,True,True)
 
-        dtxt(self.screen,"ESC 返回 | 点击武器切换选择",(W//2,H-22),15,GRAY,True,True)
+        dtxt(self.screen,"ESC 返回 | 点击武器切换选择 | ENTER 开始",(W//2,H-22),15,GRAY,True,True)
 
     def _weapon_select_click(self):
         mx,my=pygame.mouse.get_pos()
@@ -565,7 +579,6 @@ class Game:
             else: self.start_level(self.pending_level)
 
     def _warehouse_click(self):
-        mx, my = pygame.mouse.get_pos()
         self.state = "MENU"
 
     def _draw_shop(self):
@@ -580,49 +593,29 @@ class Game:
 
         # Draw shop items
         prices = [15, 25, 20, 25, 30]
-        gx0 = W // 2 - 340
-        gy0 = 120
+        gx0, gy0 = W // 2 - 340, 120
+        mx, my = pygame.mouse.get_pos()
         for i, wk in enumerate(range(5)):
             c, r = i % 3, i // 3
             rx, ry = gx0 + c * 240, gy0 + r * 140
             rw, rh = 215, 115
             w = WEAPONS[wk]
-            mx, my = pygame.mouse.get_pos()
             hvr = rx < mx < rx + rw and ry < my < ry + rh
-            bg = (55, 55, 65) if hvr else (40, 40, 48)
-            bdr = YELLOW if hvr else GRAY
-            pygame.draw.rect(self.screen, bg, (rx, ry, rw, rh), border_radius=8)
-            pygame.draw.rect(self.screen, bdr, (rx, ry, rw, rh), 2 if hvr else 1, border_radius=8)
-            dtxt(self.screen, w["name"], (rx + rw // 2, ry + 18), 20, WHITE, True, True, False)
-            dtxt(self.screen, f"伤害: {w['dmg']}", (rx + 12, ry + 45), 13, GRAY, shd=False)
-            dtxt(self.screen, f"弹匣: {w['mag']}", (rx + 12, ry + 62), 13, GRAY, shd=False)
-            dtxt(self.screen, f"备弹: {self.ammo.get(wk, 0)}/{self.reserve.get(wk, 0)}", (rx + 12, ry + 79), 13, YELLOW, shd=False)
-            dtxt(self.screen, f"{prices[wk]} 金币", (rx + 12, ry + 96), 12, YELLOW, shd=False)
-            wc = WCOL[wk]
-            pygame.draw.rect(self.screen, wc, (rx + rw - 30, ry + 10, 16, 16), border_radius=3)
+            self._draw_card(rx, ry, rw, rh, w["name"], [
+                (f"伤害: {w['dmg']} | 弹匣: {w['mag']}", GRAY, 13),
+                (f"备弹: {self.ammo.get(wk, 0)}/{self.reserve.get(wk, 0)}", YELLOW, 13),
+                (f"{prices[wk]} 金币", YELLOW, 12),
+            ], YELLOW, hvr, icon=WCOL[wk])
 
         # Grenade shop card
         grx, gry = W // 2 - 100, 400
         grw, grh = 200, 80
-        mx, my = pygame.mouse.get_pos()
         gr_hvr = grx < mx < grx + grw and gry < my < gry + grh
-        gr_bg = (55, 55, 65) if gr_hvr else (40, 40, 48)
-        gr_bdr = YELLOW if gr_hvr else GRAY
-        pygame.draw.rect(self.screen, gr_bg, (grx, gry, grw, grh), border_radius=8)
-        pygame.draw.rect(self.screen, gr_bdr, (grx, gry, grw, grh), 2 if gr_hvr else 1, border_radius=8)
-        dtxt(self.screen, "手榴弹", (grx + grw // 2, gry + 20), 20, WHITE, True, True, False)
-        dtxt(self.screen, f"当前: {self.grenades} 个", (grx + grw // 2, gry + 50), 14, YELLOW, True, True)
-        dtxt(self.screen, "40 金币", (grx + grw // 2, gry + 65), 12, YELLOW, True, True)
+        self._draw_card(grx, gry, grw, grh, "手榴弹", [
+            (f"当前: {self.grenades} 个  |  40 金币", YELLOW, 14),
+        ], YELLOW, gr_hvr)
 
-        # Bottom bar
-        for i in range(35):
-            y = H - 35 + i
-            r = i / 35
-            c = (int(YELLOW[0] * (1 - r * 0.7)), int(YELLOW[1] * (1 - r * 0.7)), int(YELLOW[2] * (1 - r * 0.7)))
-            pygame.draw.line(self.screen, c, (0, y), (W, y))
-        for x in range(-35, W + 35, 50):
-            pygame.draw.polygon(self.screen, BLACK, [(x, H - 35), (x + 25, H - 35), (x + 40, H), (x + 15, H)])
-        dtxt(self.screen, "ESC 返回菜单", (W // 2, H - 22), 15, BLACK, True, True, False)
+        self._draw_bottom_bar(35, text="ESC 返回菜单")
 
     def _shop_click(self):
         mx, my = pygame.mouse.get_pos()
@@ -662,25 +655,30 @@ class Game:
             if p["y"]<-5: p["y"]=H+5; p["x"]=random.randint(0,W)
 
     def _update_play(self):
-        keys=pygame.key.get_pressed()
-        spd=0.06
-        mx,my=pygame.mouse.get_pos()
+        keys = pygame.key.get_pressed()
+        spd = 0.06
+        mx = pygame.mouse.get_pos()[0]
 
         # Mouse look
-        mdx=mx-W//2
-        self.pa+=mdx*0.003
-        self.view_pa=self.pa
-        pygame.mouse.set_pos(W//2,H//2)
+        mdx = mx - W//2
+        self.pa += mdx * 0.003
+        pygame.mouse.set_pos(W//2, H//2)
 
         # Movement
-        nx,ny=self.px,self.py
-        cos,sin=math.cos(self.pa),math.sin(self.pa)
-        moved=False
-        if keys[pygame.K_w] or keys[pygame.K_UP]:    nx+=cos*spd; ny+=sin*spd; moved=True
-        if keys[pygame.K_s] or keys[pygame.K_DOWN]:   nx-=cos*spd; ny-=sin*spd; moved=True
-        if keys[pygame.K_a] or keys[pygame.K_LEFT]:   nx+=sin*spd; ny-=cos*spd; moved=True
-        if keys[pygame.K_d] or keys[pygame.K_RIGHT]:  nx-=sin*spd; ny+=cos*spd; moved=True
-        if moved: self.bob+=0.15
+        nx, ny = self.px, self.py
+        cos_v, sin_v = math.cos(self.pa), math.sin(self.pa)
+        moved = False
+        if keys[pygame.K_w] or keys[pygame.K_UP]:    nx += cos_v * spd; ny += sin_v * spd; moved = True
+        if keys[pygame.K_s] or keys[pygame.K_DOWN]:   nx -= cos_v * spd; ny -= sin_v * spd; moved = True
+        if keys[pygame.K_a] or keys[pygame.K_LEFT]:   nx += sin_v * spd; ny -= cos_v * spd; moved = True
+        if keys[pygame.K_d] or keys[pygame.K_RIGHT]:  nx -= sin_v * spd; ny += cos_v * spd; moved = True
+        if moved:
+            self.bob += 0.15
+        else:
+            # Decay bob toward zero when idle
+            self.bob *= 0.85
+            if abs(self.bob) < 0.01:
+                self.bob = 0
 
         m=0.25
         cx,cy=int(nx),int(ny)
@@ -698,7 +696,7 @@ class Game:
         # Jump physics
         if self.vjump>0 or self.jump_y>0:
             self.jump_y+=self.vjump
-            self.vjump-=0.15
+            self.vjump-=0.35
             if self.jump_y<=0:
                 self.jump_y=0; self.vjump=0
 
@@ -895,6 +893,48 @@ class Game:
                         break
         self.cwave+=1
 
+    # ─── UI HELPERS ────────────────────────────────────────
+    def _draw_bottom_bar(self, height=30, col=None, text=None):
+        """Draw gradient bottom bar with triangle decorations."""
+        if col is None: col = YELLOW
+        for i in range(height):
+            y = H - height + i; r = i / height
+            c = (int(col[0] * (1 - r * 0.7)),
+                 int(col[1] * (1 - r * 0.7)),
+                 int(col[2] * (1 - r * 0.7)))
+            pygame.draw.line(self.screen, c, (0, y), (W, y))
+        for x in range(-height, W + height, 50):
+            pygame.draw.polygon(self.screen, BLACK,
+                [(x, H - height), (x + 25, H - height), (x + 40, H), (x + 15, H)])
+        if text:
+            dtxt(self.screen, text, (W // 2, H - height // 2 - 4), 14, BLACK, True, True, False)
+
+    def _draw_card(self, x, y, w, h, title, subtitles=None, accent=None,
+                   hover=False, enabled=True, icon=None):
+        """Draw a UI card with title, optional subtitles and icon."""
+        if accent is None: accent = YELLOW
+        if not enabled:
+            bg = (25, 25, 28); bdr = (50, 50, 55)
+        elif hover:
+            bg = (55, 55, 65); bdr = accent
+        else:
+            bg = (40, 40, 48); bdr = GRAY
+        # Shadow
+        pygame.draw.rect(self.screen, (8, 8, 14), (x + 2, y + 2, w, h), border_radius=8)
+        # Body
+        pygame.draw.rect(self.screen, bg, (x, y, w, h), border_radius=8)
+        pygame.draw.rect(self.screen, bdr, (x, y, w, h), 2 if hover else 1, border_radius=8)
+        # Title
+        dtxt(self.screen, title, (x + w // 2, y + 20), 20, WHITE, True, True, False)
+        # Subtitles
+        if subtitles:
+            for i, (txt, clr, sz) in enumerate(subtitles):
+                dtxt(self.screen, txt, (x + w // 2, y + 48 + i * 18), sz, clr, ctr=True, shd=False)
+        # Icon badge
+        if icon:
+            ix, iy = x + w - 28, y + 12
+            pygame.draw.rect(self.screen, icon, (ix, iy, 16, 16), border_radius=3)
+
     # ─── DRAW ──────────────────────────────────────────────
     def draw(self):
         if self.state=="LOGIN": self._draw_login()
@@ -907,16 +947,126 @@ class Game:
         elif self.state=="DEAD": self._draw_game(); self._draw_overlay(False)
         elif self.state=="WIN": self._draw_game(); self._draw_overlay(True)
 
+    def _stop_login_drone(self):
+        if self._login_drone_channel:
+            try: self._login_drone_channel.stop()
+            except: pass
+            self._login_drone_channel = None
+
     def _draw_login(self):
-        self.screen.fill(BLACK)
-        dtxt(self.screen,"WARFRONT 3D",(W//2,120),52,RED,True,True)
-        dtxt(self.screen,"请输入你的名字:",(W//2,250),24,WHITE,ctr=True)
-        bx,by,bw,bh=W//2-150,290,300,40
-        pygame.draw.rect(self.screen,DGRAY,(bx,by,bw,bh),border_radius=5)
-        pygame.draw.rect(self.screen,YELLOW,(bx,by,bw,bh),2,border_radius=5)
-        dtxt(self.screen,self.name_buf+"|",(bx+10,by+8),22,WHITE,shd=False)
-        dtxt(self.screen,"按 ENTER 确认",(W//2,360),18,GRAY,ctr=True)
-        dtxt(self.screen,"提示: 中文输入法请按 Shift 切换英文模式或直接输入字母",(W//2,390),13,GRAY,ctr=True)
+        # ── Deep space gradient background ──
+        for i in range(H):
+            r = i / H
+            c = (int(6*(1-r) + 2*r), int(4*(1-r) + 1*r), int(18*(1-r) + 3*r))
+            pygame.draw.line(self.screen, c, (0, i), (W, i))
+
+        # ── Nebula blobs (soft colored glow regions) ──
+        for nb in self.login_nebulae:
+            alpha = int(12 + 8 * math.sin(self.t * 0.012 + nb["phase"]))
+            alpha = max(4, min(28, alpha))
+            glow = pygame.Surface((int(nb["r"]*2), int(nb["r"]*2)), pygame.SRCALPHA)
+            for grad in range(int(nb["r"]), 0, -2):
+                a = int(alpha * (grad/nb["r"]) * 0.4)
+                pygame.draw.circle(glow, (*nb["col"], a), (int(nb["r"]), int(nb["r"])), grad)
+            self.screen.blit(glow, (int(nb["x"]-nb["r"]), int(nb["y"]-nb["r"])))
+
+        # ── Twinkling stars ──
+        for st in self.login_stars:
+            twinkle = 0.35 + 0.65 * abs(math.sin(self.t * st["spd"] + st["phase"]))
+            alpha = int(220 * twinkle)
+            r = max(0.3, st["r"] * twinkle)
+            if r > 1.1:
+                gsz = int(r * 3)
+                gs = pygame.Surface((gsz*2, gsz*2), pygame.SRCALPHA)
+                pygame.draw.circle(gs, (*st["col"], alpha//5), (gsz, gsz), gsz)
+                self.screen.blit(gs, (int(st["x"]-gsz), int(st["y"]-gsz)))
+            pygame.draw.circle(self.screen, (*st["col"], alpha), (int(st["x"]), int(st["y"])), max(0.5, r))
+
+        # ── Subtle grid (distant sci-fi feel) ──
+        for x in range(0, W, 80):
+            pygame.draw.line(self.screen, (8, 8, 20), (x, 0), (x, H))
+        for y in range(0, H, 80):
+            pygame.draw.line(self.screen, (8, 8, 20), (0, y), (W, y))
+
+        # ── Ambient drone sound (low atmospheric hum) ──
+        if self.login_drone:
+            if self._login_drone_channel is None:
+                try: self._login_drone_channel = self.login_drone.play(-1)
+                except: pass
+
+        # ── Floating dust particles ──
+        for p in self.cparts:
+            p["x"] += p["vx"]; p["y"] += p["vy"]
+            if p["y"] < -5: p["y"] = H + 5; p["x"] = random.randint(0, W)
+            a = p["a"]; c = (int(90*a), int(110*a), int(180*a))
+            pygame.draw.circle(self.screen, c, (int(p["x"]), int(p["y"])), int(p["sz"]))
+
+        # ── Top accent bar ──
+        pygame.draw.rect(self.screen, (50, 12, 12), (0, 0, W, 3))
+
+        # ── Title with multi-layer glow ──
+        pulse = math.sin(self.t * 0.022) * 0.18 + 0.82
+        for layer in range(4, 0, -1):
+            gsz = int(56 * pulse) + layer * 7
+            ga = int(35 // (layer + 1))
+            gc = (max(0, 70-layer*16), max(0, 10-layer*2), max(0, 10-layer*2))
+            dtxt(self.screen, "WARFRONT 3D", (W//2, 95), gsz, gc, True, True, False)
+        dtxt(self.screen, "WARFRONT 3D", (W//2, 90), 54, (220, 40, 40), True, True, False)
+        dtxt(self.screen, "WARFRONT 3D", (W//2, 88), 54, (255, 80, 60), True, True, False)
+
+        # ── Decorative accent lines ──
+        line_y1, line_y2 = 132, 182
+        for ly in [line_y1, line_y2]:
+            for dx in range(-70, 80, 18):
+                lx = W//2 + dx
+                a = 200 - abs(dx) * 3
+                if a > 0:
+                    c = (min(255, int(YELLOW[0]*a//200)),
+                         min(255, int(YELLOW[1]*a//200)),
+                         min(255, int(YELLOW[2]*a//200)))
+                    pygame.draw.line(self.screen, c, (lx, ly), (lx+12, ly), 1)
+
+        # ── Subtitle ──
+        dtxt(self.screen, "玩  家  登  录", (W//2, 157), 28, (210, 175, 60), ctr=True, shd=False)
+
+        # ── Prompt ──
+        dtxt(self.screen, "请输入用户名", (W//2, 218), 18, (140, 150, 180), ctr=True, shd=False)
+
+        # ── Input box with animated border glow ──
+        bx, by, bw, bh = W//2 - 170, 258, 340, 52
+        glow_a = int(50 + 35 * math.sin(self.t * 0.035))
+        glow_rect = pygame.Surface((bw + 14, bh + 14), pygame.SRCALPHA)
+        for i in range(7, 0, -1):
+            a = int(glow_a * (1 - i/8))
+            pygame.draw.rect(glow_rect, (255, 180, 30, a),
+                             (7-i, 7-i, bw+i*2, bh+i*2), border_radius=10)
+        self.screen.blit(glow_rect, (bx - 7, by - 7))
+        # Box body
+        pygame.draw.rect(self.screen, (8, 8, 16), (bx, by, bw, bh), border_radius=6)
+        pygame.draw.rect(self.screen, (255, 175, 30), (bx, by, bw, bh), 2, border_radius=6)
+        # Inner recessed look
+        pygame.draw.rect(self.screen, (18, 18, 32), (bx+3, by+3, bw-6, bh-6), border_radius=4)
+
+        # Cursor + text
+        cursor = "▎" if self.t % 45 < 30 else " "
+        display_text = self.name_buf + cursor if len(self.name_buf) < 16 else self.name_buf
+        dtxt(self.screen, display_text, (bx + 14, by + 14), 26, (210, 210, 230), shd=False)
+        # Character count
+        dtxt(self.screen, f"{len(self.name_buf)}/16", (bx + bw - 32, by + 38), 11, GRAY, shd=False)
+
+        # ── Hint bar ──
+        hint_y = 360
+        hint_glow = pygame.Surface((420, 46), pygame.SRCALPHA)
+        pygame.draw.rect(hint_glow, (255, 180, 20, 6), (0, 0, 420, 46), border_radius=20)
+        self.screen.blit(hint_glow, (W//2 - 210, hint_y - 5))
+        pygame.draw.rect(self.screen, (12, 12, 24), (W//2 - 200, hint_y, 400, 36), border_radius=18)
+        pygame.draw.rect(self.screen, (55, 45, 28), (W//2 - 200, hint_y, 400, 36), 1, border_radius=18)
+        dtxt(self.screen, "ENTER 确认登录    ESC 退出游戏", (W//2, hint_y + 18), 14,
+             (170, 150, 110), ctr=True, shd=False)
+
+        # ── Version footer ──
+        dtxt(self.screen, "v1.0  |  Raycasting FPS  |  Powered by Pygame",
+             (W//2, H - 20), 11, (25, 25, 45), ctr=True, shd=False)
 
     def _draw_menu(self):
         horizon_y = 420
@@ -941,56 +1091,41 @@ class Game:
         dtxt(self.screen,"选择模式",(W//2,200),28,WHITE,True,True)
         pygame.draw.line(self.screen,(80,0,0),(0,170),(W,170),1)
 
+        mx, my = pygame.mouse.get_pos()
+        bx, by = W//2-220, 280
+
         # Level challenge card
-        bx,by=W//2-220,280
-        hvr=bx<pygame.mouse.get_pos()[0]<bx+200 and by<pygame.mouse.get_pos()[1]<by+160
-        pygame.draw.rect(self.screen,(50,50,60) if hvr else (35,35,42),(bx,by,200,160),border_radius=10)
-        pygame.draw.rect(self.screen,YELLOW if hvr else GRAY,(bx,by,200,160),2,border_radius=10)
-        dtxt(self.screen,"关卡挑战",(bx+100,by+50),24,WHITE,True,True)
-        dtxt(self.screen,"9 个关卡",(bx+100,by+85),16,GRAY,ctr=True)
-        dtxt(self.screen,"逐步解锁武器",(bx+100,by+110),14,DGREEN,ctr=True)
+        hvr = bx<mx<bx+200 and by<my<by+160
+        self._draw_card(bx, by, 200, 160, "关卡挑战",
+            [("9 个关卡", GRAY, 16), ("逐步解锁武器", DGREEN, 14)], YELLOW, hvr)
 
         # Classic mode card
-        bx2=W//2+20
-        hvr2=bx2<pygame.mouse.get_pos()[0]<bx2+200 and by<pygame.mouse.get_pos()[1]<by+160
-        pygame.draw.rect(self.screen,(50,50,60) if hvr2 else (35,35,42),(bx2,by,200,160),border_radius=10)
-        pygame.draw.rect(self.screen,YELLOW if hvr2 else GRAY,(bx2,by,200,160),2,border_radius=10)
-        dtxt(self.screen,"经典模式",(bx2+100,by+50),24,WHITE,True,True)
-        dtxt(self.screen,"开放地图探索",(bx2+100,by+85),16,GRAY,ctr=True)
-        dtxt(self.screen,"100x100 大地图",(bx2+100,by+110),14,DGREEN,ctr=True)
+        bx2 = W//2+20
+        hvr2 = bx2<mx<bx2+200 and by<my<by+160
+        self._draw_card(bx2, by, 200, 160, "经典模式",
+            [("开放地图探索", GRAY, 16), ("100x100 大地图", DGREEN, 14)], YELLOW, hvr2)
 
-        # My Warehouse button (under level challenge)
-        wx,wy=bx,by+180
-        hvr_w=wx<pygame.mouse.get_pos()[0]<wx+200 and wy<pygame.mouse.get_pos()[1]<wy+60
-        pygame.draw.rect(self.screen,(50,50,60) if hvr_w else (35,35,42),(wx,wy,200,60),border_radius=10)
-        pygame.draw.rect(self.screen,YELLOW if hvr_w else GRAY,(wx,wy,200,60),2,border_radius=10)
-        dtxt(self.screen,"我的仓库",(wx+100,wy+30),22,WHITE,True,True)
+        # My Warehouse button
+        wx, wy = bx, by+180
+        hvr_w = wx<mx<wx+200 and wy<my<wy+60
+        self._draw_card(wx, wy, 200, 60, "我的仓库", hover=hvr_w)
 
-        # Shop button (under classic mode)
-        sx,sy=bx2,by+180
-        hvr_s=sx<pygame.mouse.get_pos()[0]<sx+200 and sy<pygame.mouse.get_pos()[1]<sy+60
-        pygame.draw.rect(self.screen,(50,50,60) if hvr_s else (35,35,42),(sx,sy,200,60),border_radius=10)
-        pygame.draw.rect(self.screen,YELLOW if hvr_s else GRAY,(sx,sy,200,60),2,border_radius=10)
-        dtxt(self.screen,"商店",(sx+100,sy+30),22,WHITE,True,True)
-        dtxt(self.screen,"出售子弹、手榴弹",(sx+100,sy+48),11,GRAY,ctr=True)
+        # Shop button
+        sx, sy = bx2, by+180
+        hvr_s = sx<mx<sx+200 and sy<my<sy+60
+        self._draw_card(sx, sy, 200, 60, "商店",
+            [("出售子弹、手榴弹", GRAY, 11)], YELLOW, hvr_s)
 
         dtxt(self.screen,"按 1 关卡挑战 | 按 2 经典模式 | ESC 退出",(W//2,H-50),14,GRAY,ctr=True)
 
         # Exit login button (bottom-right corner)
         ex_x, ex_y = W-130, H-80
-        mx, my = pygame.mouse.get_pos()
         hvr_ex = ex_x < mx < ex_x+120 and ex_y < my < ex_y+35
         pygame.draw.rect(self.screen, (60,40,40) if hvr_ex else (40,25,25), (ex_x, ex_y, 120, 35), border_radius=6)
         pygame.draw.rect(self.screen, RED if hvr_ex else GRAY, (ex_x, ex_y, 120, 35), 2, border_radius=6)
         dtxt(self.screen, "退出登录", (ex_x+60, ex_y+17), 16, WHITE, True, True)
 
-        # Bottom bar
-        for i in range(30):
-            y=H-30+i; r=i/30
-            c=(int(YELLOW[0]*(1-r*0.7)),int(YELLOW[1]*(1-r*0.7)),int(YELLOW[2]*(1-r*0.7)))
-            pygame.draw.line(self.screen,c,(0,y),(W,y))
-        for x in range(-30,W+30,50):
-            pygame.draw.polygon(self.screen,BLACK,[(x,H-30),(x+25,H-30),(x+40,H),(x+15,H)])
+        self._draw_bottom_bar(30)
 
     def _draw_select(self):
         self.screen.fill((18,18,22))
@@ -999,36 +1134,29 @@ class Game:
         dtxt(self.screen,"选择关卡",(W//2,50),38,WHITE,True,True)
         pygame.draw.line(self.screen,YELLOW,(W//2-180,85),(W//2+180,85),2)
 
-        gx0=W//2-340; gy0=110
+        gx0, gy0 = W//2-340, 110
+        mx, my = pygame.mouse.get_pos()
         for i in range(9):
-            c,r=i%3,i//3; rx,ry=gx0+c*240,gy0+r*140
-            rw,rh=215,115; ul=i<=self.max_ul
-            mx,my=pygame.mouse.get_pos()
-            hvr=rx<mx<rx+rw and ry<my<ry+rh and ul
-            bg=(55,55,65) if hvr else (40,40,48) if ul else (25,25,28)
-            bdr=YELLOW if hvr else GRAY if ul else (50,50,55)
-            pygame.draw.rect(self.screen,bg,(rx,ry,rw,rh),border_radius=8)
-            pygame.draw.rect(self.screen,bdr,(rx,ry,rw,rh),2 if hvr else 1,border_radius=8)
+            c, r = i%3, i//3; rx, ry = gx0+c*240, gy0+r*140
+            rw, rh = 215, 115; ul = i<=self.max_ul
+            hvr = rx<mx<rx+rw and ry<my<ry+rh and ul
             if ul:
-                pygame.draw.circle(self.screen,YELLOW if hvr else (180,160,50),(rx+22,ry+22),14)
-                dtxt(self.screen,str(i+1),(rx+22,ry+22),16,BLACK,True,True,False)
-                dtxt(self.screen,LEVELS[i]["name"],(rx+45,ry+14),20,WHITE,True)
-                diff=min(5,i//2+1)
-                dtxt(self.screen,"★"*diff+"☆"*(5-diff),(rx+12,ry+45),14,YELLOW,shd=False)
-                dtxt(self.screen,f"{LEVELS[i]['waves']} waves",(rx+12,ry+68),12,GRAY,shd=False)
+                self._draw_card(rx, ry, rw, rh, "", [
+                    (LEVELS[i]["name"], WHITE, 20),
+                    ("★"*min(5,i//2+1)+"☆"*(5-min(5,i//2+1)), YELLOW, 14),
+                    (f"{LEVELS[i]['waves']} waves", GRAY, 12),
+                ], YELLOW, hvr)
+                # Level number badge
+                badge_c = YELLOW if hvr else (180,160,50)
+                pygame.draw.circle(self.screen, badge_c, (rx+22, ry+22), 14)
+                dtxt(self.screen, str(i+1), (rx+22, ry+22), 16, BLACK, True, True, False)
                 if LEVELS[i].get("ul"):
-                    wn=", ".join(WEAPONS[w]["name"] for w in LEVELS[i]["ul"])
-                    dtxt(self.screen,f"解锁: {wn}",(rx+12,ry+88),11,DGREEN,shd=False)
+                    wn = ", ".join(WEAPONS[w]["name"] for w in LEVELS[i]["ul"])
+                    dtxt(self.screen, f"解锁: {wn}", (rx+12, ry+88), 11, DGREEN, shd=False)
             else:
-                dtxt(self.screen,"LOCKED",(rx+rw//2,ry+rh//2),18,(60,60,65),True,True,False)
+                self._draw_card(rx, ry, rw, rh, "LOCKED", enabled=False)
 
-        for i in range(35):
-            y=H-35+i; r=i/35
-            c=(int(YELLOW[0]*(1-r*0.7)),int(YELLOW[1]*(1-r*0.7)),int(YELLOW[2]*(1-r*0.7)))
-            pygame.draw.line(self.screen,c,(0,y),(W,y))
-        for x in range(-35,W+35,50):
-            pygame.draw.polygon(self.screen,BLACK,[(x,H-35),(x+25,H-35),(x+40,H),(x+15,H)])
-        dtxt(self.screen,"ESC 返回 | 点击关卡开始",(W//2,H-22),15,BLACK,True,True,False)
+        self._draw_bottom_bar(35, text="ESC 返回 | 点击关卡开始")
 
     # ─── 3D GAME RENDER ───────────────────────────────────
     def _draw_game(self):
@@ -1047,7 +1175,7 @@ class Game:
 
         # ── PUBG-style jump camera (scene + walls shift together) ──
         if not self.tp:
-            jump_off = int(self.jump_y * 3)
+            jump_off = int(self.jump_y * 1.0)
         else:
             jump_off = 0
 
@@ -1125,10 +1253,11 @@ class Game:
         scaled=pygame.transform.scale(buf,(W,H))
         self.screen.blit(scaled,(0,0))
 
-        # Damage flash
-        if self.dflash>0:
-            fl=pygame.Surface((W,H),pygame.SRCALPHA); fl.fill((255,0,0,min(100,self.dflash)))
-            self.screen.blit(fl,(0,0))
+        # Damage flash (reuse cached surface)
+        if self.dflash > 0:
+            alpha = min(100, int(self.dflash))
+            self.dmg_flash.fill((255, 0, 0, alpha))
+            self.screen.blit(self.dmg_flash, (0, 0))
 
         # Muzzle flash
         if self.muzzle>0:
@@ -1165,11 +1294,16 @@ class Game:
             dtxt(self.screen,f"- WAVE {self.cwave+1} -",(W//2,H//2-30),40,RED,True,True)
 
     def _draw_weapon(self):
-        wk=self.weapons[self.cur_w]; wc=WCOL[wk]
-        # First person jump bob: weapon moves down when player jumps up
-        jump_bob=int(self.jump_y*4)
-        bx=W//2+80; by=H-50+int(self.recoil*5)-jump_bob
-        shapes=[
+        wk = self.weapons[self.cur_w]; wc = WCOL[wk]
+        # Walking bob — gentle sinusoidal sway (horizontal + vertical)
+        walk_x = int(math.sin(self.bob * 1.5) * 4) if self.bob > 0 else 0
+        walk_y = int(abs(math.cos(self.bob * 1.5)) * 2) if self.bob > 0 else 0
+        # Jump bob — pistol dips at takeoff/landing, sits neutral mid-air
+        # Use a reduced multiplier so the weapon stays visible on screen
+        jump_bob = int(self.jump_y * 0.5)
+        bx = W//2 + 80 + walk_x
+        by = H - 50 + int(self.recoil * 5) - jump_bob + walk_y
+        shapes = [
             [(bx-15,by-60,30,50),(bx-10,by-20,20,35)],
             [(bx-12,by-100,24,80),(bx-8,by-25,16,40),(bx-6,by-110,12,15)],
             [(bx-14,by-110,28,90),(bx-10,by-25,20,40)],
@@ -1180,11 +1314,16 @@ class Game:
             pygame.draw.rect(self.screen,wc if rect==shapes[wk][0] else DGRAY,rect)
 
     def _draw_hud(self):
-        hh=60; hy=H-hh
-        for i in range(hh):
-            r=i/hh; c=(int(YELLOW[0]*r*0.3),int(YELLOW[1]*r*0.3),int(YELLOW[2]*r*0.3))
-            pygame.draw.line(self.screen,c,(0,hy+i),(W,hy+i))
-        pygame.draw.line(self.screen,YELLOW,(0,hy),(W,hy),2)
+        hh = 60; hy = H - hh
+        # Build cached gradient once
+        if self.hud_gradient is None:
+            self.hud_gradient = pygame.Surface((W, hh), pygame.SRCALPHA)
+            for i in range(hh):
+                r = i / hh
+                c = (int(YELLOW[0] * r * 0.3), int(YELLOW[1] * r * 0.3), int(YELLOW[2] * r * 0.3))
+                pygame.draw.line(self.hud_gradient, c, (0, i), (W, i))
+        self.screen.blit(self.hud_gradient, (0, hy))
+        pygame.draw.line(self.screen, YELLOW, (0, hy), (W, hy), 2)
 
         dtxt(self.screen,"HP",(12,hy+8),13,YELLOW,True,shd=False)
         dbar(self.screen,35,hy+8,150,14,self.hp/self.max_hp,GREEN if self.hp>30 else RED)
@@ -1218,55 +1357,55 @@ class Game:
 
     def _draw_minimap(self):
         if not self.world: return
+        MS = self.MS
         if self.minimap_big:
-            ms=12; ox=W//2; oy=0; mw=self.MS*ms; mh=self.MS*ms
-            # Background
-            pygame.draw.rect(self.screen,(0,0,0,180),(ox,oy,mw,mh))
+            ms = 12; ox = W//2; oy = 0; mw = MS * ms; mh = MS * ms
         else:
-            ms=2; ox=W-160; oy=10; mw=self.MS*ms; mh=self.MS*ms
-            pygame.draw.rect(self.screen,(0,0,0,160),(ox-2,oy-2,mw+4,mh+4))
+            ms = 2; ox = W - MS * ms - 10; oy = 10; mw = MS * ms; mh = MS * ms
 
-        # Only draw visible portion for large maps
-        view_px=self.px; view_py=self.py
-        r=50 if self.minimap_big else 25
-        for y in range(max(0,int(view_py-r)),min(self.MS,int(view_py+r))):
-            for x in range(max(0,int(view_px-r)),min(self.MS,int(view_px+r))):
-                t=self.world[y][x]
-                if t==1: c=GRAY
-                elif t>=2: c=DGREEN
-                else: c=(20,20,25)
-                rx=ox+(x-(view_px-r if self.minimap_big else 0))*ms
-                ry=oy+(y-(view_py-r if self.minimap_big else 0))*ms
-                if self.minimap_big:
-                    rx=ox+x*ms; ry=oy+y*ms
-                pygame.draw.rect(self.screen,c,(rx,ry,ms,ms))
+        # Background
+        bg_alpha = 180 if self.minimap_big else 160
+        pygame.draw.rect(self.screen, (0, 0, 0, bg_alpha), (ox - 2, oy - 2, mw + 4, mh + 4))
 
-        # Player dot
-        if self.minimap_big:
-            ppx=ox+int(self.px*ms); ppy=oy+int(self.py*ms)
-        else:
-            ppx=ox+int(self.px*ms); ppy=oy+int(self.py*ms)
-        pygame.draw.circle(self.screen,YELLOW,(ppx,ppy),max(2,ms*2))
-        # Direction line
-        dl=max(5,ms*4)
-        pygame.draw.line(self.screen,YELLOW,(ppx,ppy),
-            (ppx+int(math.cos(self.pa)*dl),ppy+int(math.sin(self.pa)*dl)),2)
+        # Pre-render static world tiles to a surface (cache until world changes)
+        cache_key = (id(self.world), self.minimap_big)
+        if self._mini_world_key != cache_key:
+            self._mini_world_surf = pygame.Surface((mw, mh))
+            self._mini_world_surf.fill((20, 20, 25))
+            for y in range(MS):
+                for x in range(MS):
+                    t = self.world[y][x]
+                    if t == 1:
+                        c = GRAY
+                    elif t >= 2:
+                        c = DGREEN
+                    else:
+                        continue  # skip empty tiles (already bg color)
+                    self._mini_world_surf.fill(c, (x * ms, y * ms, ms, ms))
+            self._mini_world_key = cache_key
+
+        # Blit static map
+        self.screen.blit(self._mini_world_surf, (ox, oy))
+
+        # Player dot & direction
+        ppx = ox + int(self.px * ms); ppy = oy + int(self.py * ms)
+        dl = max(5, ms * 4)
+        pygame.draw.circle(self.screen, YELLOW, (ppx, ppy), max(2, ms * 2))
+        pygame.draw.line(self.screen, YELLOW, (ppx, ppy),
+                         (ppx + int(math.cos(self.pa) * dl), ppy + int(math.sin(self.pa) * dl)), 2)
 
         # Enemy dots
         for e in self.enemies:
             if not e["alive"]: continue
-            if self.minimap_big:
-                ex=ox+int(e["x"]*ms); ey=oy+int(e["y"]*ms)
-            else:
-                ex=ox+int(e["x"]*ms); ey=oy+int(e["y"]*ms)
-            if ox<ex<ox+mw and oy<ey<oy+mh:
-                pygame.draw.circle(self.screen,RED,(ex,ey),max(1,ms))
+            ex = ox + int(e["x"] * ms); ey = oy + int(e["y"] * ms)
+            if ox <= ex <= ox + mw and oy <= ey <= oy + mh:
+                pygame.draw.circle(self.screen, RED, (ex, ey), max(1, ms))
 
         if self.minimap_big:
-            dtxt(self.screen,"按 M 关闭",(ox+mw//2,oy+mh+10),14,WHITE,True,True)
+            dtxt(self.screen, "按 M 关闭", (ox + mw // 2, oy + mh + 10), 14, WHITE, True, True)
 
-    def _draw_overlay(self,won):
-        ov=pygame.Surface((W,H),pygame.SRCALPHA); ov.fill((0,0,0,160)); self.screen.blit(ov,(0,0))
+    def _draw_overlay(self, won):
+        self.screen.blit(self.overlay_surf, (0, 0))
         if won:
             dtxt(self.screen,"MISSION COMPLETE",(W//2,H//2-60),48,YELLOW,True,True)
             dtxt(self.screen,"任 务 完 成",(W//2,H//2-10),28,(200,200,100),ctr=True)
